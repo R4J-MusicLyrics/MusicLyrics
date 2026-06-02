@@ -353,20 +353,6 @@ _BUTTON_THEMES = [
     },
 ]
 _current_theme_index: int = 0
-_ROW_COLORS = ["🔴", "🔵", "🟢"]  # Red, Blue, Green cycle for bottom rows
-_row_color_index: int = 0
-
-
-def _get_next_row_color() -> str:
-    """Advance row color index and return next color circle emoji."""
-    global _row_color_index
-    _row_color_index = (_row_color_index + 1) % len(_ROW_COLORS)
-    return _ROW_COLORS[_row_color_index]
-
-
-def _get_current_row_color() -> str:
-    """Get current row color circle emoji."""
-    return _ROW_COLORS[_row_color_index % len(_ROW_COLORS)]
 
 
 def _get_next_color() -> str:
@@ -389,7 +375,6 @@ def _control_keyboard(color: str = "") -> InlineKeyboardMarkup:
     YORSA button links to user's GitHub repo.
     """
     t = _get_current_theme()
-    rc = _get_current_row_color()
     bot_username = bot.me.username if bot.me else "MusicLyrics"
     return InlineKeyboardMarkup(
         [
@@ -401,17 +386,17 @@ def _control_keyboard(color: str = "") -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    f"{rc} ᴀᴅᴅ ᴛᴏ ɢʀᴏᴜᴘ {rc}",
+                    f"➕ ᴀᴅᴅ ᴛᴏ ɢʀᴏᴜᴘ {t['yorsa']}",
                     url=f"https://t.me/{bot_username}?startgroup=true",
                 ),
                 InlineKeyboardButton(
-                    f"{rc} 💬 ꜱᴜᴘᴘᴏʀᴛ {rc}",
+                    f"{t['home']} 💬 ꜱᴜᴘᴘᴏʀᴛ",
                     url=Config.SUPPORT_GROUP,
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    f"{rc}  ✧ CLOSE ✧  {rc}",
+                    f"{t['close']}  ✧ CLOSE ✧  {t['close']}",
                     callback_data="ctl_stop",
                 ),
             ],
@@ -770,9 +755,6 @@ async def _start_progress_timer(chat_id: int, duration: int):
             else:
                 color = "🎵"
 
-            # Cycle row colors (red, blue, green) every update
-            _get_next_row_color()
-            
             progress_text = _format_progress(elapsed, total)
 
             dur = format_duration(total)
