@@ -353,6 +353,20 @@ _BUTTON_THEMES = [
     },
 ]
 _current_theme_index: int = 0
+_ROW_COLORS = ["🔴", "🔵", "🟢"]  # Red, Blue, Green cycle for bottom rows
+_row_color_index: int = 0
+
+
+def _get_next_row_color() -> str:
+    """Advance row color index and return next color circle emoji."""
+    global _row_color_index
+    _row_color_index = (_row_color_index + 1) % len(_ROW_COLORS)
+    return _ROW_COLORS[_row_color_index]
+
+
+def _get_current_row_color() -> str:
+    """Get current row color circle emoji."""
+    return _ROW_COLORS[_row_color_index % len(_ROW_COLORS)]
 
 
 def _get_next_color() -> str:
@@ -375,6 +389,7 @@ def _control_keyboard(color: str = "") -> InlineKeyboardMarkup:
     YORSA button links to user's GitHub repo.
     """
     t = _get_current_theme()
+    rc = _get_current_row_color()
     bot_username = bot.me.username if bot.me else "MusicLyrics"
     return InlineKeyboardMarkup(
         [
@@ -386,17 +401,17 @@ def _control_keyboard(color: str = "") -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    f"➕ ᴀᴅᴅ ᴛᴏ ɢʀᴏᴜᴘ {t['yorsa']}",
+                    f"{rc} ᴀᴅᴅ ᴛᴏ ɢʀᴏᴜᴘ {rc}",
                     url=f"https://t.me/{bot_username}?startgroup=true",
                 ),
                 InlineKeyboardButton(
-                    f"{t['home']} 💬 ꜱᴜᴘᴘᴏʀᴛ",
+                    f"{rc} 💬 ꜱᴜᴘᴘᴏʀᴛ {rc}",
                     url=Config.SUPPORT_GROUP,
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    f"{t['close']}  ✧ CLOSE ✧  {t['close']}",
+                    f"{rc}  ✧ CLOSE ✧  {rc}",
                     callback_data="ctl_stop",
                 ),
             ],
@@ -723,8 +738,8 @@ async def _start_progress_timer(chat_id: int, duration: int):
     
     async def _update_progress():
         """Periodically update the Now Playing message with progress."""
-        update_interval = 15  # Update every 15 seconds
-        color_cycle_interval = 2  # Change color every 2 updates (30 seconds)
+        update_interval = 5  # Update every 5 seconds
+        color_cycle_interval = 6  # Change color every 6 updates (30 seconds)
         update_count = 0
         
         while True:
@@ -754,6 +769,9 @@ async def _start_progress_timer(chat_id: int, duration: int):
                 color = _get_next_color()
             else:
                 color = "🎵"
+
+            # Cycle row colors (red, blue, green) every update
+            _get_next_row_color()
             
             progress_text = _format_progress(elapsed, total)
 
