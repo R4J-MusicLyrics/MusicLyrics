@@ -202,12 +202,14 @@ async def start_cmd(client, message: Message):
                     message.chat.id,
                     video=chosen["url"],
                     caption="",
+                    has_spoiler=True,
                 )
             else:
                 await client.send_photo(
                     message.chat.id,
                     photo=chosen["url"],
                     caption="",
+                    has_spoiler=True,
                 )
         except Exception as media_err:
             _LOG.warning("Could not send start media (%s): %s", chosen["url"], media_err)
@@ -220,12 +222,14 @@ async def start_cmd(client, message: Message):
                                 message.chat.id,
                                 video=fallback["url"],
                                 caption="",
+                                has_spoiler=True,
                             )
                         else:
                             await client.send_photo(
                                 message.chat.id,
                                 photo=fallback["url"],
                                 caption="",
+                                has_spoiler=True,
                             )
                         break
                     except Exception:
