@@ -38,6 +38,7 @@ from MusicLyrics.plugins.play.stream import (
     _get_current_theme,
     _start_progress_timer,
     _add_reaction,
+    _get_play_semaphore,
 )
 from MusicLyrics.plugins.play.prefetch import prefetch_next, mark_resolved
 from MusicLyrics.plugins.play.platforms.youtube import (
@@ -442,26 +443,31 @@ async def vplay_command(client: Client, message: Message):
 
     platform = _detect_platform(query)
 
-    try:
-        # Pre-join VC concurrently while resolving media (speed optimization)
-        pre_join_task = asyncio.create_task(pre_join_vc(chat_id))
+    # Use per-chat semaphore to prevent multiple concurrent resolves
+    sem = _get_play_semaphore(chat_id)
+    if sem.locked():
+        await status_msg.edit_text("⏳ আগের গান প্রসেস হচ্ছে... অপেক্ষা করুন।")
+    async with sem:
         try:
-            info, media_path, is_stream = await _resolve_video(query, platform)
-        finally:
+            # Pre-join VC concurrently while resolving media (speed optimization)
+            pre_join_task = asyncio.create_task(pre_join_vc(chat_id))
             try:
-                await pre_join_task
-            except Exception:
-                pass
-    except ValueError as exc:
-        await status_msg.edit_text(f"❌ **Error:** {exc}")
-        return
-    except Exception as exc:
-        LOG.exception("Unexpected error in /vplay for %s", chat_id)
-        await status_msg.edit_text(
-            f"❌ কিছু একটা সমস্যা হয়েছে। পরে আবার চেষ্টা করুন।\n"
-            f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`"
-        )
-        return
+                info, media_path, is_stream = await _resolve_video(query, platform)
+            finally:
+                try:
+                    await pre_join_task
+                except Exception:
+                    pass
+        except ValueError as exc:
+            await status_msg.edit_text(f"❌ **Error:** {exc}")
+            return
+        except Exception as exc:
+            LOG.exception("Unexpected error in /vplay for %s", chat_id)
+            await status_msg.edit_text(
+                f"❌ কিছু একটা সমস্যা হয়েছে। পরে আবার চেষ্টা করুন।\n"
+                f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`"
+            )
+            return
 
     title = info.get("title", "Unknown")
     duration = info.get("duration", 0)
