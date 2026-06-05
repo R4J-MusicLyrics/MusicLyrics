@@ -1365,20 +1365,30 @@ async def leave_voice_chat(chat_id: int) -> None:
     left = False
 
     # Issue leave commands aggressively — both APIs, multiple retries.
+    # CRITICAL: every call MUST be wrapped with asyncio.wait_for, otherwise
+    # a wedged pytgcalls connection hangs leave_call() forever and the
+    # entire bot stops responding (no skip, no /play, no leave).
+    LEAVE_METHOD_TIMEOUT = 4.0
     if pytgcalls is not None:
-        for attempt in range(3):
+        for attempt in range(2):
             for method_name in ("leave_call", "leave_group_call"):
                 fn = getattr(pytgcalls, method_name, None)
                 if fn is None:
                     continue
                 try:
-                    await fn(chat_id)
+                    await asyncio.wait_for(fn(chat_id), timeout=LEAVE_METHOD_TIMEOUT)
                     LOG.info(
                         "leave_voice_chat: %s succeeded for %s (attempt %d)",
                         method_name, chat_id, attempt + 1,
                     )
                     left = True
                     break
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "leave_voice_chat: %s TIMED OUT for %s (attempt %d) — moving on",
+                        method_name, chat_id, attempt + 1,
+                    )
+                    continue
                 except Exception as e:
                     # "NotInGroupCallError" etc. count as success — we're out.
                     err_name = type(e).__name__.lower()
@@ -1395,8 +1405,8 @@ async def leave_voice_chat(chat_id: int) -> None:
                     )
             if left:
                 break
-            if attempt < 2:
-                await asyncio.sleep(0.25)
+            if attempt < 1:
+                await asyncio.sleep(0.15)
 
     if not left:
         LOG.error(

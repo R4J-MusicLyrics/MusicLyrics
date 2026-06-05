@@ -441,59 +441,40 @@ async def _resolve_query(query: str, platform: str, msg: Message):
         return info, media_path, is_stream
 
     # -- Plain text query --
-    # PRIORITY (user-requested, matches /vplay flow):
-    # Step 1: YouTube yt-dlp search+download FIRST (sequential await — strictly prioritised)
-    # Step 2: ONLY if Step 1 fails: YouTube stream URL
-    # Step 3: ONLY if Step 2 fails: JioSaavn + SoundCloud concurrent
+    # PERFORMANCE: race ALL platforms concurrently — first usable result wins.
+    # YouTube stream-URL and JioSaavn search are very fast (~1-3 s), so they
+    # almost always beat the slower yt-dlp download path.  Falling back to
+    # SoundCloud or yt-dlp download happens only if the fast paths all fail.
 
     import asyncio as _aio
 
-    # ── Step 1: yt-dlp search+download (STRICT FIRST PRIORITY) ──
-    LOG.info("Query search: yt-dlp search+download FIRST (sequential) for: %s", query)
-    try:
-        fp, dl_info = await search_and_download_audio(query)
-        if fp and os.path.isfile(fp):
-            LOG.info("yt-dlp search+download succeeded for: %s", query)
-            if dl_info:
-                if dl_info.get("duration", 0) > Config.DURATION_LIMIT_MIN * 60 and dl_info["duration"] > 0:
-                    raise ValueError(
-                        f"গানটি {Config.DURATION_LIMIT_MIN} মিনিটের বেশি, "
-                        "play করা যাবে না।"
-                    )
-                return dl_info, fp, False
-            return ({"title": "Unknown", "url": "", "duration": 0, "thumbnail": "", "channel": ""}, fp, False)
-    except ValueError:
-        raise
-    except Exception as e:
-        LOG.info("yt-dlp search+download failed for '%s': %s", query, e)
+    DUR_LIMIT_SEC = Config.DURATION_LIMIT_MIN * 60
 
-    # ── Step 2: YouTube stream URL fallback ──
-    LOG.info("Query search: search+download failed, trying YouTube stream URL for: %s", query)
-    try:
-        yt = await search_youtube(query)
-        if yt:
-            if yt["duration"] > Config.DURATION_LIMIT_MIN * 60 and yt["duration"] > 0:
-                raise ValueError(
-                    f"গানটি {Config.DURATION_LIMIT_MIN} মিনিটের বেশি, "
-                    "play করা যাবে না।"
-                )
+    def _duration_ok(d):
+        return not (d and d > DUR_LIMIT_SEC)
+
+    # ── Fast path #1: YouTube search → stream URL ──
+    async def _try_youtube_url():
+        try:
+            yt = await search_youtube(query)
+            if not yt:
+                return None
+            if not _duration_ok(yt.get("duration", 0)):
+                return ("__duration_exceeded__", yt["duration"], None)
             su = await get_audio_stream_url(yt["url"])
             if su:
-                LOG.info("YouTube stream URL succeeded for: %s", query)
                 return yt, su, True
-    except ValueError:
-        raise
-    except Exception as e:
-        LOG.info("YouTube stream URL failed for '%s': %s", query, e)
+        except Exception as e:
+            LOG.debug("youtube_url search failed: %s", e)
+        return None
 
-    # ── Step 3: YouTube fully failed — JioSaavn + SoundCloud concurrent ──
-    LOG.info("Query search: YouTube failed, trying JioSaavn + SoundCloud for: %s", query)
-
-    async def _jiosaavn_search_and_stream():
-        """Search JioSaavn — CDN URL gives instant playback for Indian songs."""
+    # ── Fast path #2: JioSaavn search (Indian songs usually win here) ──
+    async def _try_jiosaavn():
         try:
             js_search = await search_jiosaavn(query)
             if js_search and js_search.get("download_url"):
+                if not _duration_ok(js_search.get("duration", 0)):
+                    return ("__duration_exceeded__", js_search["duration"], None)
                 info = {
                     "title": js_search.get("title", "Unknown"),
                     "url": js_search.get("url", ""),
@@ -503,11 +484,14 @@ async def _resolve_query(query: str, platform: str, msg: Message):
                     "platform": "jiosaavn",
                 }
                 return info, js_search["download_url"], True
-        except Exception:
-            pass
+        except Exception as e:
+            LOG.debug("jiosaavn search failed: %s", e)
+        # Fallback: download
         try:
             js_path, js_info = await search_and_download_jiosaavn(query)
             if js_path and js_info and os.path.isfile(js_path):
+                if not _duration_ok(js_info.get("duration", 0)):
+                    return ("__duration_exceeded__", js_info["duration"], None)
                 info = {
                     "title": js_info.get("title", "Unknown"),
                     "url": js_info.get("url", ""),
@@ -517,39 +501,81 @@ async def _resolve_query(query: str, platform: str, msg: Message):
                     "platform": "jiosaavn",
                 }
                 return info, js_path, False
-        except Exception:
-            pass
+        except Exception as e:
+            LOG.debug("jiosaavn download failed: %s", e)
         return None
 
-    async def _soundcloud_search():
-        """Search SoundCloud concurrently."""
+    # ── Slow path: yt-dlp search+download (reliable but takes time) ──
+    async def _try_youtube_download():
+        try:
+            fp, dl_info = await search_and_download_audio(query)
+            if fp and os.path.isfile(fp):
+                if dl_info and not _duration_ok(dl_info.get("duration", 0)):
+                    return ("__duration_exceeded__", dl_info["duration"], None)
+                info = dl_info or {
+                    "title": "Unknown", "url": "", "duration": 0,
+                    "thumbnail": "", "channel": "",
+                }
+                return info, fp, False
+        except Exception as e:
+            LOG.debug("youtube download failed: %s", e)
+        return None
+
+    # ── Last resort: SoundCloud ──
+    async def _try_soundcloud():
         try:
             sc_path, sc_info = await search_and_download_soundcloud(query)
             if sc_path and sc_info:
+                if not _duration_ok(sc_info.get("duration", 0)):
+                    return ("__duration_exceeded__", sc_info["duration"], None)
                 is_stream = bool(sc_info.get("_is_stream_url"))
                 if is_stream or os.path.isfile(str(sc_path)):
                     return sc_info, sc_path, is_stream
-        except Exception:
-            pass
+        except Exception as e:
+            LOG.debug("soundcloud failed: %s", e)
         return None
 
-    stream_tasks = [
-        _aio.create_task(_jiosaavn_search_and_stream()),
-        _aio.create_task(_soundcloud_search()),
-    ]
+    LOG.info("Query search: racing all platforms concurrently for: %s", query)
 
-    pending = set(stream_tasks)
-    while pending:
-        done, pending = await _aio.wait(pending, return_when=_aio.FIRST_COMPLETED)
-        for task in done:
-            try:
-                result = task.result()
-                if result:
-                    for p in pending:
-                        p.cancel()
-                    return result
-            except Exception:
-                pass
+    tasks = {
+        _aio.create_task(_try_jiosaavn()): "jiosaavn",
+        _aio.create_task(_try_youtube_url()): "youtube_url",
+        _aio.create_task(_try_youtube_download()): "youtube_dl",
+        _aio.create_task(_try_soundcloud()): "soundcloud",
+    }
+
+    duration_exceeded = None
+    pending = set(tasks.keys())
+    try:
+        while pending:
+            done, pending = await _aio.wait(pending, return_when=_aio.FIRST_COMPLETED)
+            for task in done:
+                platform_name = tasks.get(task, "?")
+                try:
+                    result = task.result()
+                except Exception:
+                    result = None
+                if not result:
+                    continue
+                # Duration-limit hit on any platform — stop everything
+                if isinstance(result, tuple) and result and result[0] == "__duration_exceeded__":
+                    duration_exceeded = result[1]
+                    continue
+                LOG.info("Query search WON by %s for: %s", platform_name, query)
+                for p in pending:
+                    p.cancel()
+                return result
+    finally:
+        # Defensive: ensure no orphan tasks linger
+        for p in pending:
+            if not p.done():
+                p.cancel()
+
+    if duration_exceeded:
+        raise ValueError(
+            f"গানটি {Config.DURATION_LIMIT_MIN} মিনিটের বেশি, "
+            "play করা যাবে না।"
+        )
 
     raise ValueError("কোনো result পাওয়া যায়নি। অন্য keyword দিয়ে চেষ্টা করুন।")
 
