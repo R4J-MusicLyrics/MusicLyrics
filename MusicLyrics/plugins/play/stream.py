@@ -123,7 +123,7 @@ def _get_skip_lock(chat_id: int) -> asyncio.Lock:
     return _skip_locks[chat_id]
 
 
-async def acquire_skip_lock(chat_id: int, timeout: float = 12.0) -> asyncio.Lock:
+async def acquire_skip_lock(chat_id: int, timeout: float = 5.0) -> asyncio.Lock:
     """Acquire the skip lock with a timeout.
 
     If the existing lock is stuck (held longer than *timeout* seconds — e.g.
@@ -684,10 +684,40 @@ async def _do_play(chat_id: int, stream):
     # forever on flaky networks / dropped assistant connections.  Without
     # this timeout the caller's skip-lock would never be released and EVERY
     # subsequent music command would deadlock.
-    PLAY_METHOD_TIMEOUT = 15.0
+    #
+    # Keep this short: skip / auto-next must feel snappy.  3 methods × 6 s
+    # = 18 s worst-case for a single attempt, ~36 s including the auto-join
+    # retry pass.  Real Telegram play() either responds in <2 s or is
+    # already hung on a stale call — waiting longer just makes the user
+    # think the bot is dead.
+    PLAY_METHOD_TIMEOUT = 6.0
 
-    async def _try_play():
+    async def _reset_call_state():
+        """Leave the call to clear py-tgcalls internal state.
+
+        When pytgcalls.play() hangs on a track replacement, retrying the
+        same call usually hangs too because py-tgcalls' internal stream
+        state is wedged.  A fresh leave+rejoin almost always unblocks it.
+        """
+        for method_name in ("leave_call", "leave_group_call"):
+            fn = getattr(pytgcalls, method_name, None)
+            if fn is None:
+                continue
+            try:
+                await asyncio.wait_for(fn(chat_id), timeout=3.0)
+                LOG.info("_reset_call_state: %s succeeded for %s", method_name, chat_id)
+                return
+            except Exception as e:
+                LOG.debug("_reset_call_state: %s failed for %s: %s", method_name, chat_id, e)
+
+    async def _try_play(reset_first: bool = False):
         """Attempt all play methods — returns True on success."""
+        if reset_first:
+            await _reset_call_state()
+            _active_chats.discard(chat_id)
+            # Brief pause for Telegram to register the leave before rejoin
+            await asyncio.sleep(0.3)
+
         # Method 1: play() with GroupCallConfig (py-tgcalls >= 2.1)
         if _HAS_GROUP_CALL_CONFIG:
             try:
@@ -703,6 +733,10 @@ async def _do_play(chat_id: int, stream):
                 return True
             except asyncio.TimeoutError:
                 LOG.warning("play() with GroupCallConfig TIMED OUT for %s", chat_id)
+                # If the call is wedged, methods 2/3 will hang too — reset now.
+                await _reset_call_state()
+                _active_chats.discard(chat_id)
+                await asyncio.sleep(0.2)
             except (TypeError, AttributeError) as e:
                 LOG.debug("play() with GroupCallConfig failed: %s", e)
 
@@ -717,6 +751,9 @@ async def _do_play(chat_id: int, stream):
             return True
         except asyncio.TimeoutError:
             LOG.warning("plain play() TIMED OUT for %s", chat_id)
+            await _reset_call_state()
+            _active_chats.discard(chat_id)
+            await asyncio.sleep(0.2)
         except Exception as e:
             LOG.debug("play() failed: %s", e)
 
@@ -737,8 +774,13 @@ async def _do_play(chat_id: int, stream):
 
         return False
 
-    # First attempt
+    # First attempt — no reset needed
     if await _try_play():
+        return
+
+    # Second attempt — reset call state first (handles wedged py-tgcalls)
+    LOG.info("First play attempt failed for %s — resetting call state and retrying", chat_id)
+    if await _try_play(reset_first=True):
         return
 
     # If first attempt failed, assistant might not be in the group yet.
@@ -1617,7 +1659,7 @@ async def _on_stream_end(client, update):
     try:
         # Acquire per-chat skip lock — waits if manual skip/stop is in progress.
         # Timeout-aware so a wedged previous holder cannot freeze auto-next forever.
-        lock = await acquire_skip_lock(chat_id, timeout=12.0)
+        lock = await acquire_skip_lock(chat_id, timeout=5.0)
         try:
             # Re-check if chat is still active (may have been stopped while waiting for lock)
             if chat_id not in _active_chats:
@@ -1675,7 +1717,14 @@ async def _on_stream_end(client, update):
             _active_chats.discard(chat_id)
 
             try:
-                success = await _fresh_resolve_and_play(chat_id, next_item)
+                try:
+                    success = await asyncio.wait_for(
+                        _fresh_resolve_and_play(chat_id, next_item),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    LOG.warning("Auto-next resolve+play TIMED OUT for %s", chat_id)
+                    success = False
                 # Kick off prefetch for the FOLLOWING item so the next
                 # auto-next / skip is also instant.
                 try:
@@ -1692,7 +1741,10 @@ async def _on_stream_end(client, update):
                         if fallback_item is None:
                             break
                         try:
-                            success = await _fresh_resolve_and_play(chat_id, fallback_item)
+                            success = await asyncio.wait_for(
+                                _fresh_resolve_and_play(chat_id, fallback_item),
+                                timeout=15.0,
+                            )
                             if success:
                                 next_item = fallback_item
                                 break

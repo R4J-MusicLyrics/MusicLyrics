@@ -143,7 +143,7 @@ async def skip_cmd(client: Client, message: Message):
     # acquire_skip_lock has a built-in timeout — if the previous holder
     # wedged (e.g. pytgcalls.play() hung), the lock is force-replaced so
     # this command can still proceed instead of deadlocking forever.
-    lock = await acquire_skip_lock(chat_id, timeout=12.0)
+    lock = await acquire_skip_lock(chat_id, timeout=5.0)
     try:
         # Stop progress timer
         _stop_progress_timer(chat_id)
@@ -180,7 +180,7 @@ async def skip_cmd(client: Client, message: Message):
             try:
                 success = await asyncio.wait_for(
                     _fresh_resolve_and_play(chat_id, next_item),
-                    timeout=25.0,
+                    timeout=15.0,
                 )
             except asyncio.TimeoutError:
                 LOG.warning("Skip resolve+play TIMED OUT for %s", chat_id)
@@ -205,7 +205,7 @@ async def skip_cmd(client: Client, message: Message):
                     try:
                         success = await asyncio.wait_for(
                             _fresh_resolve_and_play(chat_id, fallback_item),
-                            timeout=25.0,
+                            timeout=15.0,
                         )
                         if success:
                             next_item = fallback_item
@@ -265,7 +265,7 @@ async def stop_cmd(client: Client, message: Message):
     # Acquire skip lock to prevent race with auto-next.
     # Timeout-aware acquire: if a previous play() wedged, we replace the
     # lock so /stop always works.
-    lock = await acquire_skip_lock(chat_id, timeout=10.0)
+    lock = await acquire_skip_lock(chat_id, timeout=5.0)
     try:
         # Stop progress timer
         _stop_progress_timer(chat_id)
@@ -500,7 +500,7 @@ async def cb_skip(client: Client, callback: CallbackQuery):
     # Acquire skip lock to prevent race with auto-next.
     # acquire_skip_lock force-replaces a wedged lock so the chat never
     # becomes unresponsive after a single bad skip.
-    lock = await acquire_skip_lock(chat_id, timeout=12.0)
+    lock = await acquire_skip_lock(chat_id, timeout=5.0)
     try:
         if not is_active(chat_id):
             return
@@ -540,7 +540,7 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             try:
                 success = await asyncio.wait_for(
                     _fresh_resolve_and_play(chat_id, next_item),
-                    timeout=25.0,
+                    timeout=15.0,
                 )
             except asyncio.TimeoutError:
                 LOG.warning("cb_skip resolve+play TIMED OUT for %s", chat_id)
@@ -565,7 +565,7 @@ async def cb_skip(client: Client, callback: CallbackQuery):
                     try:
                         success = await asyncio.wait_for(
                             _fresh_resolve_and_play(chat_id, fallback_item),
-                            timeout=25.0,
+                            timeout=15.0,
                         )
                         if success:
                             next_item = fallback_item
