@@ -1772,6 +1772,77 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
     return True
 
 
+# -- Auto-recovering chain player --------------------------------------------
+
+async def _try_play_chain(chat_id: int, first_item, max_attempts: int = 5):
+    """Try playing queue items one after another until one succeeds.
+
+    Starts with *first_item* (already popped from the queue by the caller).
+    On failure, pops the next item from the queue and tries that one,
+    repeating up to ``max_attempts`` total attempts.
+
+    Crucially, every attempt routes through
+    ``_fresh_resolve_and_play → stream_audio/_video → _do_play`` and
+    ``_do_play`` already contains a full auto-rejoin path: if a prior
+    failure caused the assistant userbot to drop out of the voice chat
+    (or pytgcalls got wedged and we had to issue a raw-API leave) the
+    NEXT call rejoins the VC transparently before streaming.  This is
+    what fixes the "skip → can't play next → bot leaves VC and freezes"
+    bug: instead of bailing out and clearing the queue, we keep trying
+    subsequent songs and let _do_play rejoin for us.
+
+    Returns the QueueItem that successfully started playing, or ``None``
+    if the queue is exhausted / all attempts failed.
+    """
+    from MusicLyrics.plugins.play.queue import skip_queue as _sq  # avoid circular import
+
+    item = first_item
+    attempt = 0
+    while item is not None and attempt < max_attempts:
+        attempt += 1
+        title = getattr(item, "title", "?")
+        try:
+            success = await asyncio.wait_for(
+                _fresh_resolve_and_play(chat_id, item),
+                timeout=35.0,
+            )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "_try_play_chain: resolve+play TIMED OUT for '%s' in %s (attempt %d/%d)",
+                title, chat_id, attempt, max_attempts,
+            )
+            success = False
+        except Exception as e:
+            LOG.warning(
+                "_try_play_chain: resolve+play raised for '%s' in %s (attempt %d/%d): %s",
+                title, chat_id, attempt, max_attempts, e,
+            )
+            success = False
+
+        if success:
+            # New track is playing — start prefetching the FOLLOWING item so
+            # the next /skip or auto-next is also instant.
+            try:
+                asyncio.create_task(prefetch_next(chat_id))
+            except Exception:
+                pass
+            return item
+
+        LOG.info(
+            "_try_play_chain: '%s' failed in %s — popping next item and retrying "
+            "(attempt %d/%d, will auto-rejoin VC if dropped)",
+            title, chat_id, attempt, max_attempts,
+        )
+        # Pop next item from queue and try it
+        try:
+            item = await _sq(chat_id, force=True)
+        except Exception as e:
+            LOG.debug("_try_play_chain: skip_queue failed: %s", e)
+            item = None
+
+    return None
+
+
 # -- Stream-end callback ---
 
 async def _on_stream_end(client, update):
@@ -1916,49 +1987,31 @@ async def _on_stream_end(client, update):
             _active_chats.discard(chat_id)
 
             try:
-                try:
-                    success = await asyncio.wait_for(
-                        _fresh_resolve_and_play(chat_id, next_item),
-                        timeout=35.0,
-                    )
-                except asyncio.TimeoutError:
-                    LOG.warning("Auto-next resolve+play TIMED OUT for %s", chat_id)
-                    success = False
-                # Kick off prefetch for the FOLLOWING item so the next
-                # auto-next / skip is also instant.
-                try:
-                    asyncio.create_task(prefetch_next(chat_id))
-                except Exception:
-                    pass
-                if not success:
-                    # Single fallback — multiple retries used to compound
-                    # timeouts and leave the bot unresponsive for over a
-                    # minute when one track failed.
-                    LOG.warning("Auto-next failed for '%s', trying ONE more track", next_item.title)
-                    fallback_item = await skip_queue(chat_id, force=True)
-                    if fallback_item is not None:
-                        try:
-                            success = await asyncio.wait_for(
-                                _fresh_resolve_and_play(chat_id, fallback_item),
-                                timeout=35.0,
-                            )
-                            if success:
-                                next_item = fallback_item
-                        except Exception:
-                            success = False
+                # Try playing the next track AND, if it fails, walk further
+                # down the queue trying each subsequent item.  This is what
+                # prevents the chat from getting stuck: a single bad track
+                # no longer kicks the bot out of the voice chat.  _do_play
+                # will auto-rejoin VC if the assistant got dropped during
+                # an earlier failed attempt — see the auto-join block in
+                # _do_play around the "trying to auto-join assistant" log.
+                played = await _try_play_chain(chat_id, next_item, max_attempts=5)
 
-                    if not success:
-                        try:
-                            err_msg = await bot.send_message(
-                                chat_id,
-                                f"❌ **পরের গানটি চলানো যায়নি:** {next_item.title}\n\n"
-                                "Voice chat থেকে বের হচ্ছে। আবার `/play` দিন।",
-                            )
-                            await _add_reaction(chat_id, err_msg.id)
-                        except Exception:
-                            pass
-                        await leave_voice_chat(chat_id)
-                        return
+                if played is None:
+                    try:
+                        err_msg = await bot.send_message(
+                            chat_id,
+                            "❌ **পরের কয়েকটা গানই চলানো যাচ্ছে না।**\n\n"
+                            "Voice chat থেকে বের হচ্ছি। আবার `/play` দিন।",
+                        )
+                        await _add_reaction(chat_id, err_msg.id)
+                    except Exception:
+                        pass
+                    await leave_voice_chat(chat_id)
+                    return
+
+                # The item that actually started playing may not be the
+                # first one we tried — use the returned item for UI.
+                next_item = played
 
                 dur = format_duration(next_item.duration)
                 color = _get_next_color()
