@@ -352,12 +352,12 @@ async def _resolve_video(query: str, platform: str):
             raise ValueError("URL থেকে video পাওয়া যায়নি।")
         return info, media_path, is_stream
 
-    # Plain text query — Priority: yt-dlp search+download FIRST,
-    # then YouTube stream + JioSaavn + SoundCloud ALL CONCURRENTLY.
+    # Plain text query — USER-REQUESTED ORDER: YouTube FIRST every time,
+    # sequential fallback to JioSaavn then SoundCloud only if YouTube fails.
     import asyncio as _aio
 
-    # ── Step 1: yt-dlp search+download (highest priority) ──
-    LOG.info("Video query: trying yt-dlp search+download FIRST for: %s", query)
+    # ── Step 1: yt-dlp YouTube search+download (most reliable for video) ──
+    LOG.info("Video query: trying yt-dlp YouTube search+download FIRST for: %s", query)
     try:
         filepath, dl_info = await search_and_download_video(query)
         if filepath and dl_info:
@@ -371,71 +371,46 @@ async def _resolve_video(query: str, platform: str):
     except Exception as e:
         LOG.info("yt-dlp video search+download failed for '%s': %s", query, e)
 
-    # ── Step 2: ALL other platforms CONCURRENTLY ──
-    LOG.info("Video query: trying YouTube stream + JioSaavn + SoundCloud CONCURRENTLY for: %s", query)
-
-    async def _yt_video_stream():
-        try:
-            yt = await search_youtube(query)
-            if not yt:
-                return None
-            if yt["duration"] > Config.DURATION_LIMIT_MIN * 60 and yt["duration"] > 0:
-                return None
+    # ── Step 2: YouTube stream URL (Piped/Invidious/Innertube) ──
+    LOG.info("Video query: trying YouTube stream URL for: %s", query)
+    try:
+        yt = await search_youtube(query)
+        if yt and not (yt["duration"] > Config.DURATION_LIMIT_MIN * 60 and yt["duration"] > 0):
             media_path, is_stream = await _get_video_media(yt["url"])
             if media_path:
                 return yt, media_path, is_stream
-        except Exception:
-            pass
-        return None
+    except Exception as e:
+        LOG.debug("YouTube stream failed for '%s': %s", query, e)
 
-    async def _jiosaavn_video():
-        try:
-            js_path, js_info = await search_and_download_jiosaavn(query)
-            if js_path and js_info:
-                import os as _os
-                if _os.path.isfile(js_path):
-                    info = {
-                        "title": js_info.get("title", "Unknown"),
-                        "url": js_info.get("url", ""),
-                        "duration": js_info.get("duration", 0),
-                        "thumbnail": js_info.get("thumbnail", ""),
-                        "channel": js_info.get("artist", ""),
-                        "platform": "jiosaavn",
-                    }
-                    return info, js_path, False
-        except Exception:
-            pass
-        return None
+    # ── Step 3 fallback: JioSaavn (audio-only, last-line of defence) ──
+    LOG.info("Video query: YouTube failed, trying JioSaavn for: %s", query)
+    try:
+        js_path, js_info = await search_and_download_jiosaavn(query)
+        if js_path and js_info:
+            import os as _os
+            if _os.path.isfile(js_path):
+                info = {
+                    "title": js_info.get("title", "Unknown"),
+                    "url": js_info.get("url", ""),
+                    "duration": js_info.get("duration", 0),
+                    "thumbnail": js_info.get("thumbnail", ""),
+                    "channel": js_info.get("artist", ""),
+                    "platform": "jiosaavn",
+                }
+                return info, js_path, False
+    except Exception as e:
+        LOG.debug("JioSaavn fallback failed for '%s': %s", query, e)
 
-    async def _soundcloud_video():
-        try:
-            sc_path, sc_info = await search_and_download_soundcloud(query)
-            if sc_path and sc_info:
-                is_stream = bool(sc_info.get("_is_stream_url"))
-                if is_stream or os.path.isfile(str(sc_path)):
-                    return sc_info, sc_path, is_stream
-        except Exception:
-            pass
-        return None
-
-    stream_tasks = [
-        _aio.create_task(_yt_video_stream()),
-        _aio.create_task(_jiosaavn_video()),
-        _aio.create_task(_soundcloud_video()),
-    ]
-
-    pending = set(stream_tasks)
-    while pending:
-        done, pending = await _aio.wait(pending, return_when=_aio.FIRST_COMPLETED)
-        for task in done:
-            try:
-                result = task.result()
-                if result:
-                    for p in pending:
-                        p.cancel()
-                    return result
-            except Exception:
-                pass
+    # ── Step 4 last-resort: SoundCloud ──
+    LOG.info("Video query: trying SoundCloud as last resort for: %s", query)
+    try:
+        sc_path, sc_info = await search_and_download_soundcloud(query)
+        if sc_path and sc_info:
+            is_stream = bool(sc_info.get("_is_stream_url"))
+            if is_stream or os.path.isfile(str(sc_path)):
+                return sc_info, sc_path, is_stream
+    except Exception as e:
+        LOG.debug("SoundCloud fallback failed for '%s': %s", query, e)
 
     raise ValueError("কোনো result পাওয়া যায়নি।")
 
