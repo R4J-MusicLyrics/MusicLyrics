@@ -130,14 +130,9 @@ _END_HANDLING: dict[int, bool] = {}
 # stale suppressions cannot accumulate and silently swallow REAL stream-end
 # events (which would cause "bot stuck in VC" symptoms).
 _suppress_stream_end: dict[int, list[float]] = {}
-# Extended TTL: a slow pytgcalls.play() replacing the stream can now take
-# up to ~60 s in the worst case (3 methods × 12 s + auto-join + 1 retry).
-# Keep this strictly larger than the maximum _do_play wall-clock so the OLD
-# stream's StreamAudioEnded event still arrives INSIDE the suppression
-# window and is correctly swallowed.  If this TTL is too short the old
-# end-event escapes suppression, _on_stream_end treats it as a real end,
-# and the queue double-advances → "song skipped on its own" symptom.
-_SUPPRESS_TTL_SEC = 90.0
+# TTL for suppressing the OLD stream's end-event when we replace the
+# current stream.  Must cover a worst-case pytgcalls.play() cascade.
+_SUPPRESS_TTL_SEC = 45.0
 
 
 def suppress_next_stream_end(chat_id: int) -> None:
@@ -742,11 +737,11 @@ async def _do_play_locked(chat_id: int, stream):
     instead of inheriting a wedged pytgcalls connection.
 
     The total wall-clock budget is bounded:
-        3 methods × PLAY_METHOD_TIMEOUT (12s) + reset+rejoin + auto-join
-        ≤ ~55 s in the worst case.
+        3 methods × PLAY_METHOD_TIMEOUT (4s) + auto-join + 1 retry
+        ≤ ~22 s in the worst case.
 
     Callers wrap _do_play with their own outer ``asyncio.wait_for`` —
-    keep that outer timeout STRICTLY greater than this budget (>= 60s)
+    keep that outer timeout STRICTLY greater than this budget (>= 30s)
     or pytgcalls will be cancelled mid-``play()`` and left wedged for
     the next track.
     """
@@ -759,19 +754,14 @@ async def _do_play_locked(chat_id: int, stream):
     if chat_id in _active_chats:
         suppress_next_stream_end(chat_id)
 
-    # Per-method hard timeout.  WebRTC handshake (DTLS + ICE) to Telegram's
-    # voice servers regularly takes 3–8 s on the first attempt of a session
-    # and 2–5 s on subsequent track replacements.  The previous 4 s budget
-    # frequently expired DURING a healthy handshake, marking the call as
-    # "wedged" when in fact it was just slow.  Each per-method abort then
-    # cascaded through all 3 methods → "All play methods failed" →
-    # raw-leave → assistant re-joined the group → repeat (visible as the
-    # "TIMED OUT — aborting attempt → resetting call state" loop in logs).
-    #
-    # 12 s comfortably covers a real handshake while still aborting fast
-    # enough that a truly wedged native call doesn't hang the skip path
-    # (the outer _try_play_chain ATTEMPT_TIMEOUT bounds total work).
-    PLAY_METHOD_TIMEOUT = 12.0
+    # Per-method hard timeout.  4 s is enough for a healthy play() to
+    # respond — a slower response almost always means the call is wedged
+    # and the next method/reset will work better than waiting longer.
+    # Larger values (we tried 12s) made the wedge cascade painfully slow
+    # (3 × 12 = 36 s of dead air before recovery even started); 4s keeps
+    # the recovery snappy and the outer chain still retries with a fresh
+    # assistant join, which is what actually fixes wedged calls.
+    PLAY_METHOD_TIMEOUT = 4.0
 
     async def _reset_call_state():
         """Leave the call to clear py-tgcalls internal state.
@@ -817,11 +807,8 @@ async def _do_play_locked(chat_id: int, stream):
             # be swallowed and auto-next won't fire (= "song stuck / queue
             # frozen mid-track" symptom).  Drop the stale bucket here.
             _suppress_stream_end.pop(chat_id, None)
-            # Brief pause for Telegram to register the leave before rejoin.
-            # 0.3 s was too aggressive — the rejoin sometimes hit a stale
-            # call state on the server and the very next play() also timed
-            # out.  0.8 s is reliably long enough without feeling sluggish.
-            await asyncio.sleep(0.8)
+            # Brief pause for Telegram to register the leave before rejoin
+            await asyncio.sleep(0.3)
 
         # Method 1: play() with GroupCallConfig (py-tgcalls >= 2.1)
         if _HAS_GROUP_CALL_CONFIG:
@@ -948,11 +935,7 @@ async def _do_play_locked(chat_id: int, stream):
             LOG.debug("Bot add_chat_members failed: %s", e4)
 
     if joined:
-        # Give Telegram a moment to propagate the join across DCs before
-        # asking it to start a group call from the assistant session.
-        # 0.2 s sometimes lost the race and the next play() saw
-        # USER_NOT_PARTICIPANT; 0.6 s is reliably enough.
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.2)  # Brief pause for Telegram to register the join
         if await _try_play():
             return
 
@@ -1922,17 +1905,10 @@ async def _try_play_chain(chat_id: int, first_item, max_attempts: int = 5):
     """
     from MusicLyrics.plugins.play.queue import skip_queue as _sq  # avoid circular import
 
-    # Per-attempt wall-clock cap.  Must comfortably exceed one full _do_play
-    # budget so a single slow-but-healthy WebRTC handshake never gets
-    # killed mid-attempt:
-    #   _do_play worst case ≈ 3 methods × PLAY_METHOD_TIMEOUT (12 s)
-    #                       + auto-join (~5 s) + 1 retry pass
-    #                       ≈ 50 s
-    # Older 22 s budget cancelled play() mid-handshake and left pytgcalls
-    # wedged for the NEXT track (visible as "resolve+play TIMED OUT" right
-    # before the queue popped the song into oblivion).  60 s is bounded
-    # but generous; combined with max_attempts=5 the chain is still capped.
-    ATTEMPT_TIMEOUT = 60.0
+    # Per-attempt wall-clock cap.  Lower than before (was 35s) so a single
+    # bad track can't hang the skip pipeline; 22s comfortably covers a
+    # healthy resolve+play even on slow networks.
+    ATTEMPT_TIMEOUT = 22.0
 
     item = first_item
     attempt = 0
@@ -2081,12 +2057,7 @@ async def _on_stream_end(client, update):
             # case the in-flight call will produce its own stream-end so we can
             # safely skip handling this one.
             try:
-                # Wait long enough that a healthy in-flight play() (which
-                # may legitimately take ~50 s during a slow WebRTC handshake
-                # + auto-join + retry) can complete BEFORE we treat the
-                # lock as busy.  15 s used to bail too eagerly, making
-                # auto-next race the in-flight call.
-                lock = await acquire_skip_lock(chat_id, timeout=70.0)
+                lock = await acquire_skip_lock(chat_id, timeout=15.0)
             except RuntimeError:
                 LOG.warning(
                     "auto-next: skip_lock busy for %s — deferring to in-flight op",
