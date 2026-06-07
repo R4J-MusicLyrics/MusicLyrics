@@ -148,7 +148,7 @@ async def skip_cmd(client: Client, message: Message):
     # running we tell the user to retry instead of racing it (which used
     # to crash pytgcalls).
     try:
-        lock = await acquire_skip_lock(chat_id, timeout=15.0)
+        lock = await acquire_skip_lock(chat_id, timeout=70.0)
     except RuntimeError:
         await message.reply_text(
             "⏳ আগের command এখনো চলছে — একটু পরে আবার চেষ্টা করুন।"
@@ -245,7 +245,7 @@ async def stop_cmd(client: Client, message: Message):
     # previous play() is still in flight — we tell the user to retry
     # rather than racing the in-flight call (which crashed pytgcalls).
     try:
-        lock = await acquire_skip_lock(chat_id, timeout=15.0)
+        lock = await acquire_skip_lock(chat_id, timeout=70.0)
     except RuntimeError:
         await message.reply_text(
             "⏳ আগের command এখনো চলছে — একটু পরে আবার চেষ্টা করুন।"
@@ -485,7 +485,7 @@ async def cb_skip(client: Client, callback: CallbackQuery):
     # instead of force-replacing (which used to race the in-flight call
     # and crash pytgcalls).
     try:
-        lock = await acquire_skip_lock(chat_id, timeout=15.0)
+        lock = await acquire_skip_lock(chat_id, timeout=70.0)
     except RuntimeError:
         try:
             await callback.message.reply_text(
